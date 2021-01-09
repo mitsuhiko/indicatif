@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Weak};
 use std::sync::{Mutex, RwLock};
 use std::thread;
@@ -24,8 +24,6 @@ struct ProgressDrawState {
     pub force_draw: bool,
     /// True if we should move the cursor up when possible instead of clearing lines.
     pub move_cursor: bool,
-    /// Time when the draw state was created.
-    pub ts: Instant,
 }
 
 #[derive(Debug)]
@@ -36,9 +34,10 @@ enum Status {
 }
 
 enum ProgressDrawTargetKind {
-    Term(Term, Option<ProgressDrawState>, Option<Duration>),
+    Term(Term, Option<ProgressDrawState>),
     Remote(usize, Mutex<Sender<(usize, ProgressDrawState)>>),
     Hidden,
+    Threaded(ThreadedDrawTarget),
 }
 
 /// Target for draw operations
@@ -111,8 +110,20 @@ impl ProgressDrawTarget {
     /// useless escape codes in that file.
     pub fn to_term(term: Term, refresh_rate: impl Into<Option<u64>>) -> ProgressDrawTarget {
         let rate = refresh_rate.into().map(|x| Duration::from_millis(1000 / x));
-        ProgressDrawTarget {
-            kind: ProgressDrawTargetKind::Term(term, None, rate),
+        let target = ProgressDrawTarget {
+            kind: ProgressDrawTargetKind::Term(term, None),
+        };
+        // When drawing into a hidden target, do not bother batching updates.
+        // This assumes is_hidden() will always return the same value for a given target.
+        if rate.is_none() || target.is_hidden() {
+            target
+        } else {
+            ProgressDrawTarget {
+                kind: ProgressDrawTargetKind::Threaded(ThreadedDrawTarget::new(
+                    target,
+                    rate.unwrap(),
+                )),
+            }
         }
     }
 
@@ -144,25 +155,17 @@ impl ProgressDrawTarget {
             return Ok(());
         }
         match self.kind {
-            ProgressDrawTargetKind::Term(ref term, ref mut last_state, rate) => {
-                let last_draw = last_state.as_ref().map(|x| x.ts);
-                if draw_state.finished
-                    || draw_state.force_draw
-                    || rate.is_none()
-                    || last_draw.is_none()
-                    || last_draw.unwrap().elapsed() > rate.unwrap()
-                {
-                    if let Some(ref last_state) = *last_state {
-                        if !draw_state.lines.is_empty() && draw_state.move_cursor {
-                            last_state.move_cursor(term)?;
-                        } else {
-                            last_state.clear_term(term)?;
-                        }
+            ProgressDrawTargetKind::Term(ref term, ref mut last_state) => {
+                if let Some(ref last_state) = *last_state {
+                    if !draw_state.lines.is_empty() && draw_state.move_cursor {
+                        last_state.move_cursor(term)?;
+                    } else {
+                        last_state.clear_term(term)?;
                     }
-                    draw_state.draw_to_term(term)?;
-                    term.flush()?;
-                    *last_state = Some(draw_state);
                 }
+                draw_state.draw_to_term(term)?;
+                term.flush()?;
+                *last_state = Some(draw_state);
             }
             ProgressDrawTargetKind::Remote(idx, ref chan) => {
                 return chan
@@ -172,36 +175,137 @@ impl ProgressDrawTarget {
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
             }
             ProgressDrawTargetKind::Hidden => {}
+            ProgressDrawTargetKind::Threaded(ref mut t) => t.apply_draw_state(draw_state)?,
         }
         Ok(())
     }
 
     /// Properly disconnects from the draw target
-    fn disconnect(&self) {
+    fn disconnect(&mut self) {
         match self.kind {
-            ProgressDrawTargetKind::Term(_, _, _) => {}
+            ProgressDrawTargetKind::Term(_, _) => {}
             ProgressDrawTargetKind::Remote(idx, ref chan) => {
                 chan.lock()
                     .unwrap()
-                    .send((
-                        idx,
-                        ProgressDrawState {
-                            lines: vec![],
-                            orphan_lines: 0,
-                            finished: true,
-                            force_draw: false,
-                            move_cursor: false,
-                            ts: Instant::now(),
-                        },
-                    ))
+                    .send((idx, ProgressDrawState::new_clear()))
                     .ok();
             }
             ProgressDrawTargetKind::Hidden => {}
+            ProgressDrawTargetKind::Threaded(ref mut t) => {
+                t.apply_draw_state(ProgressDrawState::new_clear()).ok();
+            }
         };
     }
 }
 
+/// Target for draw operations that delays redraws to a target rate.
+///
+/// Intended to wrap a Term (or some other draw target that draws directly to the screen).
+///
+/// Implemented using a worker thread, which exits after the ThreadedDrawTarget is dropped.
+struct ThreadedDrawTarget {
+    tx: Mutex<Sender<(ProgressDrawState, Option<Sender<io::Result<()>>>)>>,
+}
+
+impl ThreadedDrawTarget {
+    fn new(mut inner: ProgressDrawTarget, rate: Duration) -> ThreadedDrawTarget {
+        let (tx, rx) = channel::<(ProgressDrawState, Option<Sender<io::Result<()>>>)>();
+
+        // Our worker thread is a detached thread that exits after the tx side of the channel is
+        // dropped (that is: after the ThreadedDrawTarget itself is dropped).
+        let _ = thread::spawn(move || {
+            // Time at which we want to draw our next frame. By initializing this to "now", the
+            // first iteration of the outer loop normally exits the recv_timeout loop immediately
+            // and waits for its first state from recv().
+            let mut target = Instant::now();
+            loop {
+                // Wait for our next scheduled draw or a state we should draw immediately.
+                let mut maybe_state = None;
+                let mut maybe_tx = None;
+                loop {
+                    match rx.recv_timeout(target.saturating_duration_since(Instant::now())) {
+                        Ok((s, tx)) => {
+                            let force_draw = s.finished || s.force_draw;
+                            maybe_state = Some(s);
+                            if tx.is_some() {
+                                maybe_tx = tx;
+                                break;
+                            }
+                            if force_draw {
+                                break;
+                            }
+                        }
+                        Err(RecvTimeoutError::Timeout) => break,
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    };
+                }
+
+                // Wait for a draw state if we did not receive one before our next scheduled draw.
+                let state = match maybe_state {
+                    Some(s) => s,
+                    None => match rx.recv() {
+                        Ok((s, tx)) => {
+                            maybe_tx = tx;
+                            s
+                        }
+                        Err(_) => return,
+                    },
+                };
+
+                let r = inner.apply_draw_state(state);
+                if let Some(tx) = maybe_tx {
+                    tx.send(r).expect("caller waits for result");
+                }
+                // Drop the error if we have no return channel. We could instead return the error
+                // from a future apply_draw_state call, but this does not seem useful: most errors
+                // get discarded in update_and_draw anyway, and the errors we're most likely to hit
+                // are permanent (if at least one caller passing in a return channel handles the
+                // error, it will get reported eventually).
+                target = Instant::now() + rate;
+            }
+        });
+
+        ThreadedDrawTarget { tx: Mutex::new(tx) }
+    }
+
+    /// Forward to apply_draw_state on the wrapped target.
+    ///
+    /// If the draw_state has the finished flag set, this waits until the wrapped target has applied
+    /// it and returns any errors from it. Otherwise, this queues the draw and immediately returns
+    /// success.
+    fn apply_draw_state(&mut self, draw_state: ProgressDrawState) -> io::Result<()> {
+        let (maybe_tx, maybe_rx) = if draw_state.finished {
+            let (tx, rx) = channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        self.tx
+            .lock()
+            .unwrap()
+            .send((draw_state, maybe_tx))
+            .expect("worker thread does not exit");
+
+        if let Some(rx) = maybe_rx {
+            rx.recv().expect("worker thread always replies")
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl ProgressDrawState {
+    fn new_clear() -> ProgressDrawState {
+        ProgressDrawState {
+            lines: vec![],
+            orphan_lines: 0,
+            finished: true,
+            force_draw: false,
+            move_cursor: false,
+        }
+    }
+
     pub fn clear_term(&self, term: &Term) -> io::Result<()> {
         term.clear_last_lines(self.lines.len() - self.orphan_lines)
     }
@@ -532,7 +636,6 @@ impl ProgressBar {
             finished: state.is_finished(),
             force_draw: true,
             move_cursor: false,
-            ts: Instant::now(),
         };
 
         state.draw_target.apply_draw_state(draw_state).ok();
@@ -808,7 +911,6 @@ fn draw_state(state: &mut ProgressState) -> io::Result<()> {
         finished: state.is_finished(),
         force_draw: false,
         move_cursor: false,
-        ts: Instant::now(),
     };
     state.draw_target.apply_draw_state(draw_state)
 }
@@ -1050,7 +1152,6 @@ impl MultiProgress {
             } else {
                 self.rx.recv().unwrap()
             };
-            let ts = draw_state.ts;
             let force_draw = draw_state.finished || draw_state.force_draw;
 
             let mut state = self.state.write().unwrap();
@@ -1116,7 +1217,6 @@ impl MultiProgress {
                 force_draw: force_draw || orphan_lines_count > 0,
                 move_cursor,
                 finished,
-                ts,
             })?;
         }
 
@@ -1128,7 +1228,6 @@ impl MultiProgress {
                 finished: true,
                 force_draw: true,
                 move_cursor,
-                ts: Instant::now(),
             })?;
         }
 
